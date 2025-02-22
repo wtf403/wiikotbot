@@ -5,58 +5,96 @@ import tempfile
 import asyncio
 import logging
 import numpy as np
+import getpass
+import aiohttp
 from datetime import datetime
-import random
 
 from dotenv import load_dotenv
+from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
+from PIL import Image, ImageDraw, ImageFont
+from pilmoji import Pilmoji
+from telethon import TelegramClient, errors
+from telethon.tl.functions.messages import GetAvailableEffectsRequest
 
-load_dotenv()
-
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.enums import ParseMode
+from aiogram.fsm.state import State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InlineQueryResultsButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineQuery,
-    InlineQueryResultCachedVideo,
     FSInputFile,
     InputMediaVideo,
-    InlineQueryResultArticle,
-    InputTextMessageContent,
-    InlineQueryResultMpeg4Gif,
     InlineQueryResultCachedMpeg4Gif,
+    InputTextMessageContent,
 )
-from aiogram.enums import ParseMode
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.filters import CommandStart
-from aiogram.client.default import DefaultBotProperties
 
-from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip
-from PIL import Image, ImageDraw, ImageFont
-from pilmoji import Pilmoji
-
+load_dotenv()
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE = os.getenv("DATABASE", "database.db")
 VIDEOS_DIR = os.getenv("VIDEOS", "videos")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER")
+TWO_FA_PASSWORD = os.getenv("TWO_FA_PASSWORD")
+
+TEXTS = {
+    "welcome": "😸 Welcome to the Video Note Bot!",
+    "create_new": "Send <b>video 📹</b>, <b>video link 🔗</b> or <b>video note 🪩</b>",
+    "no_templates": "📭 No templates",
+    "your_templates": "🎬 Your templates:",
+    "no_recent_videos": "📭 No recent videos",
+    "processing_video_note": "⏳ Processing video note... Please wait...",
+}
+
+SUCCESS = {
+    "text_updated": "✅ Text updated!",
+    "caption_updated": "✅ Caption updated!",
+    "video_note_created": "✅ Video note created!",
+    "template_saved": "✅ Template saved!",
+}
+ERRORS = {
+    "invalid_input": "☹️ Please use the buttons or enter valid content",
+    "audio_not_supported": "❌ Sorry, audio files are not supported yet",
+    "video_links_not_supported": "❌ Sorry, video links are not supported yet",
+    "error_processing_video_note": "❌ Error processing video note",
+    "error_updating_caption": "❌ Error updating caption",
+}
+
+BUTTONS = {
+    "create": "🎥 Create New",
+    "create:text": "#️⃣ Text",
+    "create:caption": "💬 Caption",
+    "create:effect": "✨ Effect",
+    "create:cancel": "❌ Cancel",
+    "create:done": "✅ Done",
+    "create:template": "💾 Save as Template",
+    "template": "🎬 Templates",
+    "template:delete": "🗑 Delete Template",
+    "recent": "🕑 Recent",
+    "recent:delete": "🗑 Delete Recent",
+}
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
+DEFAULT_TEMPLATE_FILE_IDS = []
+AVAILABLE_EFFECTS = {}
+EMPTY_VALUE = "N/A"
 
-# ----- FSM STATES -----
-class VideoStates(StatesGroup):
-    ADD_TEXT = State()
-    EDIT_CAPTION = State()
-
+create = State()
+router = Router()
 
 # ----- DATABASE FUNCTIONS -----
 def initialize_db():
@@ -70,7 +108,6 @@ def initialize_db():
             registration_date TEXT
         )"""
     )
-    # We add "channel_message_id" so we can later delete the message from the channel.
     cursor.execute(
         """CREATE TABLE IF NOT EXISTS video_notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,15 +117,23 @@ def initialize_db():
             uploaded_video_file_id TEXT NOT NULL,
             text TEXT,
             caption TEXT,
+            effect INTEGER,
             duration INTEGER,
             width INTEGER,
             height INTEGER,
             created_at TEXT
         )"""
     )
+    cursor.execute(
+        """CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            video_file_id TEXT NOT NULL,
+            created_at TEXT
+        )"""
+    )
     conn.commit()
     conn.close()
-
 
 def add_user(user_id: int, username: str, first_name: str):
     reg_date = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
@@ -107,6 +152,7 @@ def add_video_note(
     uploaded_video_file_id: str,
     text: str,
     caption: str,
+    effect: str,
     duration: int,
     width: int,
     height: int,
@@ -114,8 +160,8 @@ def add_video_note(
     created_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     with sqlite3.connect(DATABASE) as conn:
         conn.execute(
-            """INSERT INTO video_notes (user_id, video_note_file_id, channel_message_id, uploaded_video_file_id, text, caption, duration, width, height, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO video_notes (user_id, video_note_file_id, channel_message_id, uploaded_video_file_id, text, caption, effect, duration, width, height, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id,
                 video_note_file_id,
@@ -123,6 +169,7 @@ def add_video_note(
                 uploaded_video_file_id,
                 text,
                 caption,
+                effect,
                 duration,
                 width,
                 height,
@@ -132,12 +179,14 @@ def add_video_note(
         conn.commit()
 
 
-def get_user_videos(user_id: int):
+def get_user_videos(user_id: int, limit: int = 10):
     with sqlite3.connect(DATABASE) as conn:
         cursor = conn.execute(
-            """SELECT id, video_note_file_id, channel_message_id, uploaded_video_file_id, text, caption, duration, width, height, created_at 
-               FROM video_notes WHERE user_id = ? ORDER BY created_at DESC""",
-            (user_id,),
+            """SELECT id, video_note_file_id, channel_message_id, uploaded_video_file_id, 
+            text, caption, duration, width, height, created_at 
+            FROM video_notes WHERE user_id = ? 
+            ORDER BY created_at DESC LIMIT ?""",
+            (user_id, limit),
         )
         rows = cursor.fetchall()
     return [
@@ -160,8 +209,9 @@ def get_user_videos(user_id: int):
 def get_video_by_id(video_id: int):
     with sqlite3.connect(DATABASE) as conn:
         cursor = conn.execute(
-            """SELECT id, video_note_file_id, channel_message_id, uploaded_video_file_id, text, caption, duration, width, height, created_at 
-               FROM video_notes WHERE id = ?""",
+            """SELECT id, video_note_file_id, channel_message_id, uploaded_video_file_id, 
+            text, caption, duration, width, height, created_at 
+            FROM video_notes WHERE id = ?""",
             (video_id,),
         )
         row = cursor.fetchone()
@@ -181,30 +231,71 @@ def get_video_by_id(video_id: int):
     return None
 
 
-def update_video_text(
-    video_id: int, text: str, video_note_file_id: str, channel_message_id: int
-):
-    with sqlite3.connect(DATABASE) as conn:
-        conn.execute(
-            "UPDATE video_notes SET text = ?, video_note_file_id = ?, channel_message_id = ? WHERE id = ?",
-            (text, video_note_file_id, channel_message_id, video_id),
-        )
-        conn.commit()
-
-
 def delete_video(video_id: int):
     with sqlite3.connect(DATABASE) as conn:
         conn.execute("DELETE FROM video_notes WHERE id = ?", (video_id,))
         conn.commit()
 
 
-def update_video_caption(video_id: int, caption: str):
+# ----- TEMPLATE FUNCTIONS -----
+def add_template(user_id: int, video_file_id: str):
+    created_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     with sqlite3.connect(DATABASE) as conn:
         conn.execute(
-            "UPDATE video_notes SET caption = ? WHERE id = ?",
-            (caption, video_id),
+            "INSERT INTO templates (user_id, video_file_id, created_at) VALUES (?, ?, ?)",
+            (user_id, video_file_id, created_at),
         )
         conn.commit()
+
+
+def get_user_templates(user_id: int):
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.execute(
+            "SELECT id, video_file_id, created_at FROM templates WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+    return [
+        {"id": row[0], "video_file_id": row[1], "created_at": row[2]} for row in rows
+    ]
+
+
+def delete_template_db(template_id: int):
+    with sqlite3.connect(DATABASE) as conn:
+        conn.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+        conn.commit()
+
+
+def initialize_user_templates(user_id: int):
+    if not get_user_templates(user_id):
+        for file_id in DEFAULT_TEMPLATE_FILE_IDS:
+            add_template(user_id, file_id)
+
+
+async def load_default_templates(bot: Bot):
+    global DEFAULT_TEMPLATE_FILE_IDS
+    if not os.path.exists(VIDEOS_DIR):
+        os.makedirs(VIDEOS_DIR)
+    if not CHANNEL_ID:
+        logging.error("CHANNEL_ID is not set in environment.")
+        return
+
+    video_files = glob.glob(os.path.join(VIDEOS_DIR, "*.mp4"))
+    for video_file in video_files:
+        try:
+            with open(video_file, "rb") as f:
+                msg = await bot.send_video_note(
+                    chat_id=CHANNEL_ID,
+                    video_note=FSInputFile(video_file),
+                    disable_notification=True,
+                )
+                if msg.video_note:
+                    DEFAULT_TEMPLATE_FILE_IDS.append(msg.video_note.file_id)
+                    logging.info(f"Loaded template {video_file}")
+                else:
+                    logging.error(f"Failed to send video note for {video_file}")
+        except Exception as e:
+            logging.error(f"Error loading template {video_file}: {e}")
 
 
 # ----- HELPER FUNCTIONS FOR FILE HANDLING -----
@@ -216,27 +307,54 @@ async def download_temp_file(bot: Bot, file_id: str, suffix=".mp4") -> str:
     tmp.close()
     return tmp.name
 
-
 def cleanup_file(path: str):
     if os.path.exists(path):
         os.unlink(path)
 
 
-def main_menu_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🎥 Create New"), KeyboardButton(text="🎬 Templates")]
-        ],
-        resize_keyboard=True,
+async def send_final(
+    bot: Bot, video_note_file_id: str, caption: str, caption_up: bool, effect_id: int
+):
+    return await bot.send_video_note(
+        chat_id=CHANNEL_ID,
+        video_note=video_note_file_id,
+        caption=caption,
+        show_caption_above_media=caption_up,
+        message_effect_id=effect_id,
     )
 
 
-# ----- VIDEO PROCESSING FUNCTIONS -----
+async def process_video_file_trim(
+    bot: Bot, file_id: str, trim_duration: int = 60
+) -> str:
+    input_path = await download_temp_file(bot, file_id)
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    temp_output.close()
+    clip = VideoFileClip(input_path)
+    # Trim the clip if longer than trim_duration
+    if clip.duration > trim_duration:
+        clip = clip.subclip(0, trim_duration)
+    width, height = clip.size
+    # Crop to a square (center crop)
+    if width > height:
+        x = int((width - height) / 2)
+        y = 0
+        size = height
+    else:
+        x = 0
+        y = int((height - width) / 2)
+        size = width
+    cropped = clip.crop(x1=x, y1=y, x2=x + size, y2=y + size)
+    cropped.write_videofile(
+        temp_output.name, codec="libx264", audio_codec="aac", verbose=False, logger=None
+    )
+    clip.close()
+    cropped.close()
+    cleanup_file(input_path)
+    return temp_output.name
+
+
 async def process_video_file(bot: Bot, file_id: str) -> str:
-    """
-    Processes the video to crop it to a 1:1 ratio and returns the local path
-    of the processed video.
-    """
     input_path = await download_temp_file(bot, file_id)
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     temp_output.close()
@@ -261,10 +379,6 @@ async def process_video_file(bot: Bot, file_id: str) -> str:
 
 
 async def add_text_to_video_file(bot: Bot, file_id: str, text: str) -> str:
-    """
-    Adds text overlay to the video and returns the path of the final file.
-    Uses Pilmoji for better emoji support.
-    """
     input_path = await download_temp_file(bot, file_id)
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     temp_output.close()
@@ -277,7 +391,7 @@ async def add_text_to_video_file(bot: Bot, file_id: str, text: str) -> str:
         clip = clip.crop(x1=x, y1=y, x2=x + size, y2=y + size)
 
     fontsize = size // 16
-    font_path = "./SF-Pro.ttf"  # make sure this file is in your project
+    font_path = "./SF-Pro.ttf"
     try:
         font = ImageFont.truetype(font_path, fontsize)
     except Exception as e:
@@ -337,673 +451,531 @@ async def add_text_to_video_file(bot: Bot, file_id: str, text: str) -> str:
 
 async def send_video_note_to_channel(
     bot: Bot,
-    video,
+    video: FSInputFile,
     duration: int,
-    length: int,
+    length: int,  # This parameter will be ignored as we'll use fixed size
     user: types.User,
     caption: str,
-    text: str,
-) -> (str, types.Message):
-    """
-    Sends a video note to the designated channel (CHANNEL_ID) to obtain its file_id.
-    Also sends a reply message to the video note with user info and timestamp.
-    Returns a tuple of (video_note_file_id, channel_message).
-    """
+    caption_up: bool,
+    effect_id: int,
+    save_video: bool = False,
+):
     if not CHANNEL_ID:
         raise ValueError("CHANNEL_ID is not set in environment.")
+
     channel_message = await bot.send_video_note(
         chat_id=CHANNEL_ID,
         video_note=video,
         duration=duration,
-        length=length,
         disable_notification=True,
+        message_effect_id=effect_id,
     )
-    if not channel_message.video_note:
-        raise ValueError("Failed to send video note")
-    user_info = format_user_info(user, caption, text)
-    # Send reply message in the channel with user info and timestamp.
-    await bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=user_info,
-        reply_to_message_id=channel_message.message_id,
-        disable_notification=True,
-    )
-    return channel_message.video_note.file_id, channel_message
+
+    await bot.delete_message(CHANNEL_ID, channel_message.message_id)
+
+    if save_video:
+        msg = await send_final(
+            bot, channel_message.video_note.file_id, caption, caption_up, effect_id
+        )
+        msg.reply(
+            text=f"<b>From:</b> @{user.username or user.first_name}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_keyboard(),
+        )
+
+    return channel_message.video_note.file_id
 
 
-def format_user_info(user: types.User, caption: str = None, text: str = None) -> str:
-    """Format user info string with optional caption and text."""
-    parts = [f"From: @{user.username or user.first_name}"]
+def is_valid_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
 
-    if caption:
-        parts.append(f"Caption: {caption}")
-
-    if text:
-        parts.append(f"Text: {text}")
-
-    return "\n".join(parts)
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
 
 
 # ----- HANDLERS -----
-async def start_handler(message: Message):
+@router.message(CommandStart())
+async def start(message: Message):
     add_user(
         message.from_user.id,
         message.from_user.username or "",
         message.from_user.first_name or "",
     )
-    await message.answer(
-        "Welcome to Video note Bot!", reply_markup=main_menu_keyboard()
-    )
+    initialize_user_templates(message.from_user.id)
+    await message.answer(TEXTS["welcome"], reply_markup=main_menu_keyboard())
 
 
-async def create_new_handler(message: Message):
+@router.message(F.text == BUTTONS["create"])
+async def create_new(message: Message, state: FSMContext):
     await message.answer(
-        "Please send me a video to create a video note",
+        TEXTS["create_new"],
+        parse_mode=ParseMode.HTML,
         reply_markup=main_menu_keyboard(),
     )
+    await state.set_state(create)
 
 
-async def video_handler(message: Message, state: FSMContext):
-    if not message.video:
-        return
-    if message.video.duration > 60:
-        await message.answer("Video too long (max 60 sec).")
-        return
+@router.message()
+async def create(message: Message, state: FSMContext):
+    data = await state.get_data()
+    video_note_msg = None
 
-    add_user(
-        message.from_user.id,
-        message.from_user.username or "",
-        message.from_user.first_name or "",
-    )
+    if message.video:
+        processing_msg = await message.answer(TEXTS["processing_video_note"])
+        if message.video.duration > 60:
+            vid_path = await process_video_file_trim(
+                message.bot, message.video.file_id, trim_duration=60
+            )
+        else:
+            vid_path = await process_video_file(message.bot, message.video.file_id)
 
-    # Process the video if necessary.
-    aspect = message.video.width / message.video.height
-    if abs(aspect - 1.0) > 0.01:
-        vid_path = await process_video_file(message.bot, message.video.file_id)
-        raw_file_id = message.video.file_id
+        processed_video = FSInputFile(vid_path)
+        video_note_msg = await send_video_note_to_channel(
+            message.bot,
+            processed_video,
+            message.video.duration,
+            0,
+            message.from_user,
+            data.get("caption"),
+            True,
+            data.get("effect"),
+        )
+        await send_final(
+            message.bot,
+            video_note_msg.video_note.file_id,
+            data.get("caption"),
+            True,
+            data.get("effect"),
+        )
+        cleanup_file(vid_path)
+
+    elif message.video_note:
+        video_note_msg = message.video_note.file_id
+
+    elif message.text and is_valid_url(message.text):
+        processing_msg = await message.answer(TEXTS["processing_video_note"])
+        async with aiohttp.ClientSession() as session:
+            try:
+                api_url = "https://api.cobalt.tools"
+                payload = {
+                    "url": message.text,
+                    "videoQuality": "720",
+                    "audioFormat": "mp4",
+                    "downloadMode": "auto",
+                }
+                async with session.post(api_url, json=payload) as response:
+                    if response.status != 200:
+                        raise Exception("API request failed")
+                    data = await response.json()
+                    if data.get("status") == "error":
+                        raise Exception(
+                            f"Error from API: {data.get('error', {}).get('code')}"
+                        )
+                    vid_path = await download_temp_file(message.bot, data["file_id"])
+                    processed_video = FSInputFile(vid_path)
+                    video_note_msg = await send_video_note_to_channel(
+                        message.bot,
+                        processed_video,
+                        data.get("duration", 0),
+                        0,
+                        message.from_user,
+                        data.get("caption"),
+                        True,
+                        data.get("effect"),
+                    )
+                    cleanup_file(vid_path)
+
+            except Exception as e:
+                logging.error(f"Error processing video link: {e}")
+                await message.answer(TEXTS["video_links_not_supported"])
+                return
     else:
-        vid_path = message.video.file_id
-        raw_file_id = message.video.file_id
+        await message.answer(ERRORS["invalid_input"], reply_markup=main_menu_keyboard())
+        return
 
-    await state.update_data(
-        video_file_id=vid_path,
-        raw_video_file_id=raw_file_id,
-        caption=message.caption or "",
-        user_id=message.from_user.id,
-        video_duration=message.video.duration,
-        video_width=message.video.width,
-        video_height=message.video.height,
+    if not video_note_msg:
+        uploaded_video_file_id = video_note_msg.video_note.file_id
+
+    video_note_msg = send_final(
+        message.bot,
+        uploaded_video_file_id,
+        data.get("caption"),
+        True,
+        data.get("effect"),
     )
-    markup = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="⏩ Skip")]],
-        resize_keyboard=True,
-    )
-    await message.answer(
-        "Send me the text to overlay on your video, or press Skip to continue without text",
-        reply_markup=markup,
-    )
-    await state.set_state(VideoStates.ADD_TEXT)
+    await processing_msg.delete()
 
 
-async def text_handler(message: Message, state: FSMContext):
+@router.callback_query(F.data.startswith("create:text"))
+async def modify_text(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("raw_video_file_id"):
+        await callback.answer("No video found to update.", show_alert=True)
+        await state.clear()
+        return
+    new_text = callback.message.text.strip()
+    await state.update_data(overlay_text=new_text)
+    await callback.answer(SUCCESS["text_updated"], show_alert=True)
+
+
+@router.callback_query(F.data.startswith("create:caption"))
+async def modify_caption(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    edit_video_id = data.get("edit_video_id")
+    if not edit_video_id:
+        await callback.answer("No video found to update.", show_alert=True)
+        await state.clear()
+        return
+    new_caption = callback.message.text.strip()
+    with sqlite3.connect(DATABASE) as conn:
+        conn.execute(
+            "UPDATE video_notes SET caption = ? WHERE id = ?",
+            (new_caption, edit_video_id),
+        )
+        conn.commit()
+    await callback.answer(SUCCESS["caption_updated"], show_alert=True)
+
+
+@router.callback_query(F.data.startswith("create:effect"))
+async def modify_effect(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
-    if data.get("video_sent"):
-        await state.clear()
-        return
+    message = await callback.message.answer(
+        "Please send an emoji to apply the effect.",
+        reply_markup=create_kd(placeholder="Send a message with effect you want"),
+    )
 
-    text_input = message.text.strip() if message.text else ""
+    await state.update_data(data)
 
-    # --- Edit overlay text scenario ---
-    if data.get("edit_video_id") and data.get("state") != VideoStates.EDIT_CAPTION:
-        edit_id = data.get("edit_video_id")
-        if text_input == "⏩ Skip":
-            video = get_video_by_id(int(edit_id))
-            if not video:
-                await message.answer(
-                    "❌ Video not found", reply_markup=main_menu_keyboard()
-                )
-                await state.clear()
-                return
-            # Remove overlay: update text to empty without modifying channel message.
-            update_video_text(
-                int(edit_id),
-                "",
-                video["video_note_file_id"],
-                video["channel_message_id"],
-            )
-            await message.answer(
-                "✅ Overlay text removed successfully!",
-                reply_markup=main_menu_keyboard(),
-            )
-        else:
-            overlay_text = text_input
-            progress_msg = await message.answer(
-                "Processing video... Please wait...",
-                reply_markup=types.ReplyKeyboardRemove(),
-            )
-            try:
-                video = get_video_by_id(int(edit_id))
-                if not video:
-                    await message.answer(
-                        "❌ Video not found", reply_markup=main_menu_keyboard()
-                    )
-                    await state.clear()
-                    return
+    await callback.answer(SUCCESS["effect_updated"], show_alert=True)
 
-                final_video_path = await add_text_to_video_file(
-                    message.bot, video["uploaded_video_file_id"], overlay_text
-                )
-                final_media = FSInputFile(final_video_path)
-                final_size = min(video["width"], video["height"])
-                new_video_note_id, channel_message = await send_video_note_to_channel(
-                    message.bot,
-                    final_media,
-                    video["duration"],
-                    final_size,
-                    message.from_user,
-                    video["caption"] or "",
-                    video["text"] or "",
-                )
-                media = InputMediaVideo(
-                    media=new_video_note_id,
-                    caption=video["caption"] or "",
-                    parse_mode=ParseMode.HTML,
-                )
-                await message.answer_media_group([media])
 
-                update_video_text(
-                    int(edit_id),
-                    overlay_text,
-                    new_video_note_id,
-                    channel_message.message_id,
-                )
-                cleanup_file(final_video_path)
-                await message.answer(
-                    "✅ Overlay text updated successfully!",
-                    reply_markup=main_menu_keyboard(),
-                )
-            except Exception as e:
-                logging.error(f"Error processing video: {e}")
-                await message.answer(
-                    "❌ Error processing video",
-                    reply_markup=main_menu_keyboard(),
-                )
-            finally:
-                await progress_msg.delete()
-        await state.clear()
-        return
+@router.callback_query(F.data.startswith("create:done"))
+async def done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    raw_video_file_id = data.get("raw_video_file_id")
+    caption = data.get("caption", "")
+    overlay_text = data.get("overlay_text", "")
+    effect = data.get("effect")
+    progress_msg = await callback.bot.send_message(
+        chat_id=callback.message.chat.id, text=TEXTS["processing_video_note"]
+    )
 
-    # --- New video creation scenario ---
-    vid_source = data.get("raw_video_file_id")
-    caption = data.get("caption") or ""
-    duration = data.get("video_duration")
-    width = data.get("video_width")
-    height = data.get("video_height")
-
-    overlay_text = text_input if text_input != "⏩ Skip" else ""
-    progress_msg = await message.answer("Processing video... Please wait...")
     try:
-        if overlay_text:
-            final_video_path = await add_text_to_video_file(
-                message.bot, vid_source, overlay_text
-            )
-            final_media = FSInputFile(final_video_path)
-        else:
-            temp_path = await download_temp_file(message.bot, vid_source)
-            final_media = FSInputFile(temp_path)
-
-        final_size = min(width, height)
+        final_media = FSInputFile(raw_video_file_id)
         new_video_note_id, channel_message = await send_video_note_to_channel(
-            message.bot,
+            callback.bot,
             final_media,
-            duration,
-            final_size,
-            message.from_user,
+            data.get("video_duration", 0),
+            0,  # Length is ignored now as we use fixed size
+            callback.from_user,
             caption,
             overlay_text,
+            effect,
+            caption_up=False,
         )
-        media = InputMediaVideo(
-            media=new_video_note_id,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
+        inline_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=BUTTONS["create:template"],
+                        callback_data=f"template_save|{new_video_note_id}",
+                    )
+                ]
+            ]
         )
-        await message.answer_media_group([media])
-
-        add_video_note(
-            data.get("user_id"),
-            new_video_note_id,
-            channel_message.message_id,
-            vid_source,
-            overlay_text,
-            caption,
-            duration,
-            width,
-            height,
+        await callback.bot.send_media_group(
+            chat_id=callback.message.chat.id,
+            media=[InputMediaVideo(media=new_video_note_id, caption=caption)],
         )
-        await state.update_data(video_sent=True)
-
-        if overlay_text:
-            cleanup_file(final_video_path)
-        else:
-            cleanup_file(temp_path)
-
-        await message.answer(
-            "✅ Video note created!", reply_markup=main_menu_keyboard()
+        await callback.bot.send_message(
+            chat_id=callback.message.chat.id,
+            text=SUCCESS["video_note_created"],
+            reply_markup=inline_kb,
         )
     except Exception as e:
-        logging.error(f"Error processing video: {e}")
-        await message.answer(
-            "❌ Error processing video",
-            reply_markup=main_menu_keyboard(),
-        )
+        logging.error(f"Error finalizing video note: {e}")
+        await callback.answer(ERRORS["error_processing_video_note"], show_alert=True)
     finally:
         await progress_msg.delete()
         await state.clear()
 
 
-async def list_videos_handler(message: Message):
-    vids = get_user_videos(message.from_user.id)
-    if not vids:
-        await message.answer("📭 No video notes", reply_markup=main_menu_keyboard())
+@router.callback_query(F.data.startswith("create:cancel"))
+async def cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer(TEXTS["cancelled"], show_alert=True)
+
+
+@router.callback_query(F.data.startswith("template"))
+async def list_templates(callback: CallbackQuery):
+    templates = get_user_templates(callback.from_user.id)
+    if not templates:
+        await callback.answer(TEXTS["no_templates"], show_alert=True)
         return
-
-    header_msg = await message.answer(
-        "🎬 Your video notes:", reply_markup=main_menu_keyboard()
+    await callback.message.answer(
+        TEXTS["your_templates"], reply_markup=main_menu_keyboard()
     )
-
-    for video in vids:
+    for template in templates:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Edit Text", callback_data=f"edit_text_{video['id']}"
-                    ),
-                    InlineKeyboardButton(
-                        text="Edit Caption", callback_data=f"edit_caption_{video['id']}"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Delete",
-                        callback_data=f"delete_{video['id']}_{header_msg.message_id}",
+                        text="Delete", callback_data=f"delete_template_{template['id']}"
                     )
-                ],
+                ]
             ]
         )
-        await message.answer_video(
-            video=video["video_note_file_id"],
-            caption=video["caption"] if video["caption"] else "",
-            parse_mode=ParseMode.HTML,
+        await callback.message.answer_video(
+            video=template["video_file_id"],
+            caption="",
             reply_markup=kb,
         )
+    await callback.answer()
 
 
-async def callback_edit(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("template:delete"))
+async def delete_template(callback: CallbackQuery):
     try:
         parts = callback.data.split("_")
         if len(parts) < 3:
             await callback.answer("Invalid callback data", show_alert=True)
             return
-        video_id = parts[2]
-        video = get_video_by_id(int(video_id))
-        if video:
-            await state.update_data(
-                edit_video_id=str(video_id),
-                video_file_id=video["video_note_file_id"],
-                uploaded_video_file_id=video["uploaded_video_file_id"],
-                caption=video["caption"] if video["caption"] else "",
-                text=video["text"],
-                video_duration=video["duration"],
-                video_width=video["width"],
-                video_height=video["height"],
-                user_id=callback.from_user.id,
-            )
-            markup = ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="⏩ Skip")]],
-                resize_keyboard=True,
-            )
-            await callback.message.answer(
-                "Send me the new overlay text to apply on your video, or press Skip to remove it",
-                reply_markup=markup,
-            )
-            await state.set_state(VideoStates.ADD_TEXT)
-            await callback.answer()
-        else:
-            await callback.answer("❌ Video not found", show_alert=True)
+        template_id = int(parts[2])
+        delete_template_db(template_id)
+        await callback.message.delete()
+        await callback.answer(TEXTS["template_deleted"], show_alert=True)
     except Exception as e:
-        logging.error(f"Error in edit overlay callback: {e}")
-        await callback.answer("❌ Error editing overlay", show_alert=True)
+        logging.error(f"Error in delete template callback: {e}")
+        await callback.answer("❌ Error deleting template", show_alert=True)
 
 
-async def callback_delete(callback: CallbackQuery):
+async def list_recent(callback: CallbackQuery):
+    videos = get_user_videos(callback.from_user.id)
+    if not videos:
+        await callback.answer(TEXTS["no_recent_videos"], show_alert=True)
+        return
+    for video in videos:
+        await callback.message.answer_video(
+            video=video["video_note_file_id"],
+            caption="",
+            reply_markup=main_menu_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("recent:delete"))
+async def delete_recent(callback: CallbackQuery):
     try:
         parts = callback.data.split("_")
-        video_id = int(parts[1])
-        header_msg_id = int(parts[2]) if len(parts) > 2 else None
-
-        # Get video info before deleting
+        if len(parts) < 3:
+            await callback.answer("Invalid callback data", show_alert=True)
+            return
+        video_id = int(parts[2])
+        header_msg_id = int(parts[3]) if len(parts) > 3 else None
         video = get_video_by_id(video_id)
-        if video and video["channel_message_id"]:
+        if not video:
+            await callback.answer("❌ Video not found", show_alert=True)
+            return
+        if video["channel_message_id"]:
+            channel_msg_id = video["channel_message_id"]
             try:
-                # Delete the video note and its reply message in the channel
-                await callback.bot.delete_message(
-                    CHANNEL_ID, video["channel_message_id"]
+                # Attempt to delete the video note message
+                await callback.bot.delete_message(CHANNEL_ID, channel_msg_id)
+                # Check if the next message is a text message and delete it
+                next_msg = await callback.bot.get_message(
+                    CHANNEL_ID, channel_msg_id + 1
                 )
-                # Try to delete the reply message (it's the next message)
-                await callback.bot.delete_message(
-                    CHANNEL_ID, video["channel_message_id"] + 1
-                )
+                if "💬" in next_msg.text:
+                    await callback.bot.delete_message(CHANNEL_ID, channel_msg_id + 1)
             except Exception as e:
-                logging.warning(f"Could not delete channel message: {e}")
-
+                logging.warning(f"Could not delete channel messages: {e}")
         delete_video(video_id)
-
         try:
             await callback.message.delete()
         except Exception as e:
             logging.warning(f"Could not delete message: {e}")
-
-        vids_remaining = get_user_videos(callback.from_user.id)
-
-        if not vids_remaining and header_msg_id:
-            await callback.bot.delete_message(
-                message_id=header_msg_id,
-                chat_id=callback.message.chat.id,
-            )
-            await callback.bot.send_message(
-                chat_id=callback.message.chat.id,
-                text="📭 No video notes",
-                reply_markup=main_menu_keyboard(),
-            )
-
-        await callback.answer("🗑 Deleted")
+        remaining_videos = get_user_videos(callback.from_user.id)
+        if not remaining_videos and header_msg_id:
+            try:
+                await callback.bot.delete_message(
+                    chat_id=callback.message.chat.id, message_id=header_msg_id
+                )
+                await callback.bot.send_message(
+                    chat_id=callback.message.chat.id,
+                    text=TEXTS["no_recent_videos"],
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception as e:
+                logging.warning(f"Could not delete header message: {e}")
+        await callback.answer(TEXTS["video_deleted"], show_alert=True)
     except Exception as e:
-        logging.error(f"Error in delete callback: {e}")
+        logging.error(f"Error in delete recent callback: {e}")
         await callback.answer("❌ Error deleting video", show_alert=True)
-
-
-async def callback_edit_caption(callback: CallbackQuery, state: FSMContext):
-    try:
-        parts = callback.data.split("_")
-        if len(parts) < 3:
-            await callback.answer("Invalid callback data", show_alert=True)
-            return
-        video_id = parts[2]
-        video = get_video_by_id(int(video_id))
-        if video:
-            await state.update_data(
-                edit_video_id=str(video_id),
-                video_file_id=video["video_note_file_id"],
-                caption=video["caption"] if video["caption"] else "",
-                text=video["text"],
-                video_duration=video["duration"],
-                video_width=video["width"],
-                video_height=video["height"],
-                user_id=callback.from_user.id,
-            )
-            markup = ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="⏩ Skip")]],
-                resize_keyboard=True,
-            )
-            await callback.message.answer(
-                "Send me the new caption for your video, or press Skip to remove it",
-                reply_markup=markup,
-            )
-            await state.set_state(VideoStates.EDIT_CAPTION)
-            await callback.answer()
-        else:
-            await callback.answer("❌ Video not found", show_alert=True)
-    except Exception as e:
-        logging.error(f"Error in edit caption callback: {e}")
-        await callback.answer("❌ Error editing caption", show_alert=True)
-
-
-ephemeral_video_cache = {}
-
-PREVIEW_CACHE = {}  # Cache for preview file_ids
-
-
-async def convert_video_to_animation(video_path: str) -> str:
-    """Convert video to animation format that Telegram can handle."""
-    output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-    try:
-        clip = VideoFileClip(video_path)
-        # Ensure the video meets Telegram's requirements
-        # Max size: 384x384, Max duration: 60s
-        if clip.duration > 60:
-            clip = clip.subclip(0, 60)
-
-        if clip.size[0] > 384 or clip.size[1] > 384:
-            # Resize while maintaining aspect ratio
-            ratio = min(384 / clip.size[0], 384 / clip.size[1])
-            new_size = (int(clip.size[0] * ratio), int(clip.size[1] * ratio))
-            clip = clip.resize(new_size)
-
-        # Write with settings suitable for Telegram animations
-        clip.write_videofile(
-            output_path,
-            codec="libx264",
-            audio=False,  # Animations don't need audio
-            fps=30,  # Good frame rate for smooth playback
-            preset="ultrafast",  # Faster encoding
-            verbose=False,
-            logger=None,
-        )
-        clip.close()
-        return output_path
-    except Exception as e:
-        logging.error(f"Error converting video: {e}")
-        if os.path.exists(output_path):
-            os.unlink(output_path)
-        raise
 
 
 async def inline_query_handler(inline_query: InlineQuery):
     user_id = inline_query.from_user.id
     query_text = inline_query.query.strip()
     results = []
-
+    recent_videos = get_user_videos(user_id, limit=5)
+    for idx, video in enumerate(recent_videos):
+        caption = format_preview_text(
+            text=video["text"] or "",
+            caption=video["caption"] or "",
+            effect=video["effect"] or "",
+        )
+        result = InlineQueryResultCachedMpeg4Gif(
+            id=f"recent_{video['id']}",
+            mpeg4_file_id=video["video_note_file_id"],
+            title=f"Recent Video {idx + 1}",
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        results.append(result)
     if query_text:
-        # Show all available default videos as previews with the query text
-        default_files = glob.glob("videos/*.mp4")
-        if not default_files:
-            result = InlineQueryResultArticle(
-                id="no_default",
-                title="No default videos available",
+        templates = get_user_templates(user_id)
+        for idx, template in enumerate(templates):
+            result = InlineQueryResultCachedMpeg4Gif(
+                id=f"template_{idx}_{user_id}",
+                mpeg4_file_id=template["video_file_id"],
+                title=f"Template {idx + 1}",
+                caption=query_text,
                 input_message_content=InputTextMessageContent(
-                    message_text="No default videos available."
+                    message_text=query_text,
+                    parse_mode=ParseMode.HTML,
                 ),
             )
             results.append(result)
-        else:
-            for idx, video_path in enumerate(default_files):
-                if not os.path.exists(video_path):
-                    logging.error(f"Video file not found: {video_path}")
-                    continue
-
-                preview_key = f"{video_path}_{query_text}"
-
-                if preview_key in PREVIEW_CACHE:
-                    # Use cached preview
-                    preview_data = PREVIEW_CACHE[preview_key]
-                    preview_id = preview_data["file_id"]
-                    thumb_id = preview_data.get("thumb_id")
-                else:
-                    try:
-                        # Convert video to animation format
-                        animation_path = await convert_video_to_animation(video_path)
-                        logging.info(
-                            f"Successfully converted {video_path} to animation format"
-                        )
-
-                        # Send video as animation to get file_id
-                        with open(animation_path, "rb") as video_file:
-                            preview_msg = await inline_query.bot.send_animation(
-                                chat_id=CHANNEL_ID,
-                                animation=FSInputFile(animation_path),
-                                disable_notification=True,
-                            )
-
-                            if not preview_msg:
-                                logging.error(
-                                    f"Failed to send animation: preview_msg is None for {video_path}"
-                                )
-                                continue
-
-                            if not preview_msg.animation:
-                                logging.error(
-                                    f"Failed to get animation from message: animation is None for {video_path}"
-                                )
-                                continue
-
-                            preview_id = preview_msg.animation.file_id
-                            thumb_id = (
-                                preview_msg.animation.thumbnail.file_id
-                                if preview_msg.animation.thumbnail
-                                else None
-                            )
-
-                            logging.info(
-                                f"Successfully got file_id for {video_path}: {preview_id}"
-                            )
-
-                            PREVIEW_CACHE[preview_key] = {
-                                "file_id": preview_id,
-                                "thumb_id": thumb_id,
-                            }
-
-                            # Clean up
-                            cleanup_file(animation_path)
-                            try:
-                                await inline_query.bot.delete_message(
-                                    CHANNEL_ID, preview_msg.message_id
-                                )
-                            except Exception as ex:
-                                logging.warning(
-                                    f"Could not delete preview message: {ex}"
-                                )
-                    except Exception as e:
-                        logging.error(
-                            f"Error creating preview for {video_path}: {str(e)}"
-                        )
-                        continue
-
-                try:
-                    # Create preview result with autoplay gif
-                    result = InlineQueryResultCachedMpeg4Gif(
-                        id=f"preview_{idx}_{user_id}",
-                        mpeg4_file_id=preview_id,
-                        title=f"Video {idx + 1} with text overlay",
-                        caption=query_text,
-                    )
-                    results.append(result)
-                except Exception as e:
-                    logging.error(
-                        f"Error creating InlineQueryResultCachedMpeg4Gif: {str(e)}"
-                    )
-                    continue
-
-    else:
-        vids = get_user_videos(user_id)
-        if vids:
-            for video in vids:
-                created_at = datetime.strptime(video["created_at"], "%d.%m.%Y %H:%M:%S")
-                title = created_at.strftime("%H:%M:%S")
-                result = InlineQueryResultCachedMpeg4Gif(
-                    id=str(video["id"]),
-                    mpeg4_file_id=video["video_note_file_id"],
-                    title=title,
-                    caption=video["caption"] if video["caption"] else "",
-                    description=video["text"] if video["text"] else "",
-                )
-                results.append(result)
-        else:
-            button = InlineQueryResultsButton(
-                text="📭 No video notes. Open bot?",
-                start_parameter="create_video",
-            )
-            await inline_query.answer(
-                results=[],
-                button=button,
-                cache_time=300,
-                is_personal=True,
-            )
-            return
-
-    await inline_query.answer(results, cache_time=300, is_personal=True)
+    await inline_query.answer(
+        results,
+        cache_time=300,
+        is_personal=True,
+        switch_pm_text="Open bot",
+        switch_pm_parameter="start",
+    )
 
 
-async def caption_edit_handler(message: Message, state: FSMContext):
-    data = await state.get_data()
-
-    if data.get("video_sent"):
-        await state.clear()
-        return
-
-    new_caption = message.text.strip() if message.text else ""
-    edit_video_id = data.get("edit_video_id")
-    if not edit_video_id:
-        await message.answer(
-            "No video found to update.", reply_markup=main_menu_keyboard()
-        )
-        await state.clear()
-        return
-
-    video = get_video_by_id(int(edit_video_id))
-    if not video:
-        await message.answer("❌ Video not found", reply_markup=main_menu_keyboard())
-        await state.clear()
-        return
-
-    if new_caption == "⏩ Skip":
-        update_video_caption(int(edit_video_id), "")
-        success_message = "✅ Caption removed successfully!"
-        new_caption = ""
-    else:
-        update_video_caption(int(edit_video_id), new_caption)
-        success_message = "✅ Caption updated successfully!"
-
+async def get_available_effects() -> dict:
+    global AVAILABLE_EFFECTS
     try:
-        user_info = format_user_info(
-            message.from_user, caption=new_caption, text=video["text"]
-        )
-        await message.bot.edit_message_text(
-            text=user_info,
-            chat_id=CHANNEL_ID,
-            message_id=video["channel_message_id"] + 1,
-        )
+        client = TelegramClient("wiikotbot", int(API_ID), API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.send_code_request(PHONE_NUMBER)
+            logging.warning("Please check your Telegram app for the code.")
+            code = getpass.getpass("Enter the code you received: ")
+            try:
+                await client.sign_in(PHONE_NUMBER, code)
+            except errors.SessionPasswordNeededError:
+                password = TWO_FA_PASSWORD or getpass.getpass(
+                    "Enter your 2FA password: "
+                )
+                await client.sign_in(password=password)
+        async with client:
+            available_effects = await client(GetAvailableEffectsRequest(hash=123))
+            AVAILABLE_EFFECTS.clear()
+            for effect in available_effects.effects:
+                if hasattr(effect, "emoticon") and hasattr(effect, "id"):
+                    AVAILABLE_EFFECTS[effect.id] = {
+                        "emoticon": effect.emoticon,
+                        "static_icon_id": effect.static_icon_id,
+                        "effect_sticker_id": effect.effect_sticker_id,
+                        "effect_animation_id": effect.effect_animation_id,
+                        "premium_required": effect.premium_required,
+                    }
+            return AVAILABLE_EFFECTS
     except Exception as e:
-        logging.warning(f"Could not update channel message: {e}")
+        logging.error(f"Error getting available effects: {e}")
+        return {}
 
-    await message.answer(success_message, reply_markup=main_menu_keyboard())
-    await state.clear()
+
+async def handle_invalid_input(message: Message):
+    await message.answer(ERRORS["invalid_input"], reply_markup=main_menu_keyboard())
+
+
+def main_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BUTTONS["create"])],
+            [
+                KeyboardButton(text=BUTTONS["template"]),
+                KeyboardButton(text=BUTTONS["recent"]),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def create_kd(placeholder=None):
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=BUTTONS["create:cancel"]),
+                KeyboardButton(text=BUTTONS["create:done"]),
+            ],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=placeholder,
+    )
+
+
+def create_inline_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["create:text"], callback_data="create:text"
+                ),
+                InlineKeyboardButton(
+                    text=BUTTONS["create:caption"], callback_data="create:caption"
+                ),
+                InlineKeyboardButton(
+                    text=BUTTONS["create:effect"], callback_data="create:effect"
+                ),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# New callback for saving as a template using the final video_note_id passed in callback data.
+@router.callback_query(F.data.startswith("template_save"))
+async def save_template(callback: CallbackQuery, state: FSMContext):
+    try:
+        parts = callback.data.split("|")
+        if len(parts) < 2:
+            await callback.answer("Invalid data", show_alert=True)
+            return
+        video_note_id = parts[1]
+        add_template(callback.from_user.id, video_note_id)
+        await callback.answer(SUCCESS["template_saved"], show_alert=True)
+    except Exception as e:
+        logging.error(f"Error saving template: {e}")
+        await callback.answer("Error saving template", show_alert=True)
 
 
 # ----- MAIN FUNCTION -----
 async def main():
     initialize_db()
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await get_available_effects()
+    await load_default_templates(bot)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.message.register(start_handler, CommandStart())
-    dp.message.register(video_handler, F.video)
-    dp.message.register(text_handler, VideoStates.ADD_TEXT)
-    dp.message.register(list_videos_handler, F.text == "🎬 Templates")
-    dp.message.register(create_new_handler, F.text == "🎥 Create New")
-    dp.callback_query.register(callback_edit, F.data.startswith("edit_text_"))
-    dp.callback_query.register(callback_delete, F.data.startswith("delete_"))
 
-    dp.callback_query.register(
-        callback_edit_caption, F.data.startswith("edit_caption_")
-    )
+    dp.include_router(router)
+
     dp.inline_query.register(inline_query_handler)
-    dp.message.register(caption_edit_handler, VideoStates.EDIT_CAPTION)
 
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
