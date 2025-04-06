@@ -1,0 +1,14 @@
+---
+description: 
+globs: bot.py
+alwaysApply: false
+---
+After uploading the video add option to change the audio and video with message to the user suggesting using @clips and @sounds telegram bots. After user uploaded the new resource, update the video note (anser_video) with text overlay caption and effect before delete using message using this technique:
+you can delete messages sent by a user to the bot in private chats since bot API 4.2 released
+here is the release note: https://core.telegram.org/bots/api-changelog#april-14-2019
+    The method deleteMessage can now be used to delete messages sent by a user to the bot in private chats within 48 hours.
+
+Align keyboard bottons vertically now to suggest update user video, audio, effect, overlay text, captions, + cancel and done bottons
+
+If user trying to input another video while editing the current, print the error.
+
